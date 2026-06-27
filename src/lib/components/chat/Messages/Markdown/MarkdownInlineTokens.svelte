@@ -73,31 +73,22 @@
 			return null;
 		}
 
-		if (href.startsWith('sandbox://')) {
-			const match = /^sandbox:\/\/([^/]+)(\/.*)$/.exec(href);
-			if (!match) {
-				return null;
-			}
-
-			try {
-				const terminalId = decodeURIComponent(match[1]);
-				const path = normalizeExplicitSandboxPath(decodeURIComponent(match[2]));
-				if (!terminalId || !isAbsoluteSandboxPath(path) || path.includes('\0')) {
+		try {
+			if (href.startsWith('sandbox://')) {
+				const match = /^sandbox:\/\/([^/]+)(\/.*)$/.exec(href);
+				if (!match) {
 					return null;
 				}
-				return { terminalId, path };
-			} catch {
-				return null;
-			}
-		}
 
-		try {
+				const terminalId = decodeURIComponent(match[1]);
+				const path = normalizeExplicitSandboxPath(decodeURIComponent(match[2]));
+				return terminalId && isAbsoluteSandboxPath(path) && !path.includes('\0')
+					? { terminalId, path }
+					: null;
+			}
+
 			const path = href.slice('sandbox:'.length);
-			if (!isAbsoluteSandboxPath(path) || path.includes('\0')) {
-				return null;
-			}
-
-			return { terminalId: null, path };
+			return isAbsoluteSandboxPath(path) && !path.includes('\0') ? { terminalId: null, path } : null;
 		} catch {
 			return null;
 		}

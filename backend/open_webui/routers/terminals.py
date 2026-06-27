@@ -31,6 +31,20 @@ STREAMING_CONTENT_TYPES = ('application/octet-stream', 'image/', 'application/pd
 STRIPPED_RESPONSE_HEADERS = frozenset(('transfer-encoding', 'connection', 'content-encoding', 'content-length'))
 
 
+def _decode_until_stable(value: str) -> str | None:
+    decoded = value
+    for _ in range(8):
+        next_value = unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+
+    if unquote(decoded) != decoded:
+        return None
+
+    return decoded
+
+
 def _sanitize_proxy_path(path: str) -> str | None:
     """Sanitize a proxy path to prevent directory traversal / SSRF.
 
@@ -40,14 +54,8 @@ def _sanitize_proxy_path(path: str) -> str | None:
     """
     # Decode until stable: a single unquote pass leaves %252e%252e as %2e%2e,
     # which the upstream then re-decodes into '..', bypassing the check below.
-    decoded = path
-    for _ in range(8):
-        once = unquote(decoded)
-        if once == decoded:
-            break
-        decoded = once
-    # Fail closed: still encoded after the cap means the upstream would decode further into traversal.
-    if unquote(decoded) != decoded:
+    decoded = _decode_until_stable(path)
+    if decoded is None:
         return None
     had_trailing_slash = decoded.endswith('/')
     normalized = posixpath.normpath(decoded)
@@ -81,6 +89,11 @@ async def list_terminal_servers(request: Request, user=Depends(get_verified_user
 
 PROXY_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 INLINE_IMAGE_EXTENSIONS = frozenset(('jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'ico', 'avif'))
+FILE_FORWARD_HEADERS = ('range', 'if-range')
+TERMINAL_FILE_SECURITY_HEADERS = {
+    'Cache-Control': 'private, no-store',
+    'X-Content-Type-Options': 'nosniff',
+}
 
 
 def _is_absolute_terminal_path(path: str) -> bool:
@@ -94,14 +107,8 @@ def _normalize_terminal_file_path(path: str) -> str | None:
     if not path or '\x00' in path:
         return None
 
-    decoded = path
-    for _ in range(8):
-        next_value = unquote(decoded)
-        if next_value == decoded:
-            break
-        decoded = next_value
-
-    if unquote(decoded) != decoded:
+    decoded = _decode_until_stable(path)
+    if decoded is None:
         return None
 
     normalized = decoded.replace('\\', '/')
@@ -135,6 +142,39 @@ def _ascii_filename_fallback(filename: str) -> str:
     return sanitized[:255] or 'download'
 
 
+def _terminal_file_auth(request: Request, connection: dict, user) -> tuple[dict, dict]:
+    headers = {'X-User-Id': user.id}
+    for forwarded_header in FILE_FORWARD_HEADERS:
+        value = request.headers.get(forwarded_header)
+        if value:
+            headers[forwarded_header] = value
+
+    cookies = {}
+    auth_type = connection.get('auth_type', 'bearer')
+    if auth_type == 'bearer':
+        headers['Authorization'] = f'Bearer {connection.get("key", "")}'
+    elif auth_type == 'session':
+        cookies = request.cookies
+        headers['Authorization'] = f'Bearer {request.state.token.credentials}'
+    elif auth_type == 'system_oauth':
+        cookies = request.cookies
+        oauth_token = request.headers.get('x-oauth-access-token', '')
+        if oauth_token:
+            headers['Authorization'] = f'Bearer {oauth_token}'
+    # auth_type == "none": no Authorization header
+
+    return headers, cookies
+
+
+def _terminal_file_content_disposition(path: str, content_type: str, download: bool) -> str:
+    filename = _sanitize_download_filename(path.replace('\\', '/').rstrip('/').split('/')[-1] or 'download')
+    can_inline = _is_inline_image_path(path) and content_type.lower().startswith('image/')
+    disposition = 'inline' if not download and can_inline else 'attachment'
+    ascii_filename = _ascii_filename_fallback(filename)
+    quoted_filename = quote(filename, safe='')
+    return f'{disposition}; filename="{ascii_filename}"; filename*=UTF-8\'\'{quoted_filename}'
+
+
 @router.get('/{server_id}/files/content')
 async def get_terminal_file_content(
     server_id: str,
@@ -163,29 +203,8 @@ async def get_terminal_file_content(
         return JSONResponse({'error': 'Terminal server URL not configured'}, status_code=503)
 
     policy_id = connection.get('policy_id')
-    target_url = f'{base_url}/files/view'
-    if policy_id:
-        target_url = f'{base_url}/p/{policy_id}/files/view'
-
-    headers = {'X-User-Id': user.id}
-    for forwarded_header in ('range', 'if-range'):
-        value = request.headers.get(forwarded_header)
-        if value:
-            headers[forwarded_header] = value
-
-    cookies = {}
-    auth_type = connection.get('auth_type', 'bearer')
-    if auth_type == 'bearer':
-        headers['Authorization'] = f'Bearer {connection.get("key", "")}'
-    elif auth_type == 'session':
-        cookies = request.cookies
-        headers['Authorization'] = f'Bearer {request.state.token.credentials}'
-    elif auth_type == 'system_oauth':
-        cookies = request.cookies
-        oauth_token = request.headers.get('x-oauth-access-token', '')
-        if oauth_token:
-            headers['Authorization'] = f'Bearer {oauth_token}'
-    # auth_type == "none": no Authorization header
+    target_url = f'{base_url}/p/{policy_id}/files/view' if policy_id else f'{base_url}/files/view'
+    headers, cookies = _terminal_file_auth(request, connection, user)
 
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=300, connect=10),
@@ -208,32 +227,22 @@ async def get_terminal_file_content(
         }
         if TERMINAL_PROXY_HEADERS:
             filtered_headers.update(TERMINAL_PROXY_HEADERS)
-        filtered_headers['Cache-Control'] = 'private, no-store'
-        filtered_headers['X-Content-Type-Options'] = 'nosniff'
+        filtered_headers.update(TERMINAL_FILE_SECURITY_HEADERS)
 
         if upstream_response.status >= 400:
             status_code = upstream_response.status
             upstream_response.release()
             await session.close()
             return JSONResponse(
-                {'error': f'Terminal file request failed with status {status_code}'},
+                {'error': 'Terminal file request failed'},
                 status_code=status_code,
-                headers={
-                    'Cache-Control': 'private, no-store',
-                    'X-Content-Type-Options': 'nosniff',
-                },
+                headers=TERMINAL_FILE_SECURITY_HEADERS,
             )
 
-        filename = _sanitize_download_filename(
-            terminal_path.replace('\\', '/').rstrip('/').split('/')[-1] or 'download'
-        )
-        content_type = upstream_response.headers.get('content-type', '').lower()
-        can_inline = _is_inline_image_path(terminal_path) and content_type.startswith('image/')
-        disposition = 'inline' if not download and can_inline else 'attachment'
-        ascii_filename = _ascii_filename_fallback(filename)
-        quoted_filename = quote(filename, safe='')
-        filtered_headers['Content-Disposition'] = (
-            f'{disposition}; filename="{ascii_filename}"; filename*=UTF-8\'\'{quoted_filename}'
+        filtered_headers['Content-Disposition'] = _terminal_file_content_disposition(
+            terminal_path,
+            upstream_response.headers.get('content-type', ''),
+            download,
         )
 
         async def stream_content():
@@ -256,10 +265,7 @@ async def get_terminal_file_content(
         return JSONResponse(
             {'error': 'Terminal file request failed'},
             status_code=502,
-            headers={
-                'Cache-Control': 'private, no-store',
-                'X-Content-Type-Options': 'nosniff',
-            },
+            headers=TERMINAL_FILE_SECURITY_HEADERS,
         )
 
 
