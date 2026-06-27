@@ -42,6 +42,15 @@
 		);
 	};
 
+	const isValidSandboxPath = (path: string): boolean =>
+		isAbsoluteSandboxPath(path) && !path.includes('\0');
+
+	const isValidTerminalId = (terminalId: string): boolean =>
+		terminalId.length > 0 &&
+		!terminalId.includes('/') &&
+		!terminalId.includes('\\') &&
+		!terminalId.includes('\0');
+
 	const getSystemTerminalId = (terminalId: string | null): string | null => {
 		if (!terminalId) {
 			return null;
@@ -75,20 +84,21 @@
 
 		try {
 			if (href.startsWith('sandbox://')) {
-				const match = /^sandbox:\/\/([^/]+)(\/.*)$/.exec(href);
-				if (!match) {
+				const target = href.slice('sandbox://'.length);
+				const pathStart = target.indexOf('/');
+				if (pathStart <= 0) {
 					return null;
 				}
 
-				const terminalId = decodeURIComponent(match[1]);
-				const path = normalizeExplicitSandboxPath(decodeURIComponent(match[2]));
-				return terminalId && isAbsoluteSandboxPath(path) && !path.includes('\0')
+				const terminalId = decodeURIComponent(target.slice(0, pathStart));
+				const path = normalizeExplicitSandboxPath(decodeURIComponent(target.slice(pathStart)));
+				return isValidTerminalId(terminalId) && isValidSandboxPath(path)
 					? { terminalId, path }
 					: null;
 			}
 
 			const path = href.slice('sandbox:'.length);
-			return isAbsoluteSandboxPath(path) && !path.includes('\0') ? { terminalId: null, path } : null;
+			return isValidSandboxPath(path) ? { terminalId: null, path } : null;
 		} catch {
 			return null;
 		}

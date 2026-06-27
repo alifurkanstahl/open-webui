@@ -115,7 +115,7 @@ def _normalize_terminal_file_path(path: str) -> str | None:
     if not _is_absolute_terminal_path(normalized):
         return None
 
-    if '..' in [part for part in normalized.split('/') if part]:
+    if any(part == '..' for part in normalized.split('/')):
         return None
 
     if normalized.startswith('/'):
@@ -142,12 +142,20 @@ def _ascii_filename_fallback(filename: str) -> str:
     return sanitized[:255] or 'download'
 
 
-def _terminal_file_auth(request: Request, connection: dict, user) -> tuple[dict, dict]:
+def _connection_auth(
+    request: Request,
+    connection: dict,
+    user,
+    forwarded_headers: tuple[str | tuple[str, str], ...] = (),
+) -> tuple[dict, dict]:
     headers = {'X-User-Id': user.id}
-    for forwarded_header in FILE_FORWARD_HEADERS:
-        value = request.headers.get(forwarded_header)
+    for forwarded_header in forwarded_headers:
+        source, target = (
+            forwarded_header if isinstance(forwarded_header, tuple) else (forwarded_header, forwarded_header)
+        )
+        value = request.headers.get(source)
         if value:
-            headers[forwarded_header] = value
+            headers[target] = value
 
     cookies = {}
     auth_type = connection.get('auth_type', 'bearer')
@@ -204,7 +212,7 @@ async def get_terminal_file_content(
 
     policy_id = connection.get('policy_id')
     target_url = f'{base_url}/p/{policy_id}/files/view' if policy_id else f'{base_url}/files/view'
-    headers, cookies = _terminal_file_auth(request, connection, user)
+    headers, cookies = _connection_auth(request, connection, user, FILE_FORWARD_HEADERS)
 
     session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=300, connect=10),
@@ -305,29 +313,12 @@ async def proxy_terminal(
     if request.query_params:
         target_url += f'?{request.query_params}'
 
-    headers = {'X-User-Id': user.id}
-    # Forward per-session cwd tracking header
-    session_id = request.headers.get('x-session-id')
-    if session_id:
-        headers['X-Session-Id'] = session_id
-    cookies = {}
-    auth_type = connection.get('auth_type', 'bearer')
-
-    if auth_type == 'bearer':
-        headers['Authorization'] = f'Bearer {connection.get("key", "")}'
-    elif auth_type == 'session':
-        cookies = request.cookies
-        headers['Authorization'] = f'Bearer {request.state.token.credentials}'
-    elif auth_type == 'system_oauth':
-        cookies = request.cookies
-        oauth_token = request.headers.get('x-oauth-access-token', '')
-        if oauth_token:
-            headers['Authorization'] = f'Bearer {oauth_token}'
-    # auth_type == "none": no Authorization header
-
-    content_type = request.headers.get('content-type')
-    if content_type:
-        headers['Content-Type'] = content_type
+    headers, cookies = _connection_auth(
+        request,
+        connection,
+        user,
+        (('x-session-id', 'X-Session-Id'), ('content-type', 'Content-Type')),
+    )
 
     body = await request.body()
     session = aiohttp.ClientSession(
