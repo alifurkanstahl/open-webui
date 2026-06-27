@@ -101,6 +101,9 @@ def _normalize_terminal_file_path(path: str) -> str | None:
             break
         decoded = next_value
 
+    if unquote(decoded) != decoded:
+        return None
+
     normalized = decoded.replace('\\', '/')
     if not _is_absolute_terminal_path(normalized):
         return None
